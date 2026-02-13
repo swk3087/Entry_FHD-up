@@ -1,3 +1,10 @@
+import {
+  DEFAULT_SETTINGS,
+  ExtensionSettings,
+  loadSettings,
+  observeSettings,
+} from './settings'
+
 declare global {
   var __REQUEST_ANIMATION_FRAME_ID: number | undefined
 }
@@ -133,7 +140,7 @@ interface StageObject {
     y: number
     cursor: string
   }
-  offset: {
+  offset?: {
     x: number
     y: number
   }
@@ -142,39 +149,339 @@ interface StageObject {
   removeAllEventListeners?(event: string): void
   entity: Entity
   _viewportPatchedMode?: string
-  _events?: {
-    [k: string]: {
-      fn(event: StageEvent): void
-    }
-  }
 }
 
 interface Handle {
-  // dispatchEditStartEvent(): void
-  // getGlobalCoordinate(object: StageObject): {
-  //   x: number
-  //   y: number
-  // }
-  // knobs: StageObject[]
   getEventCoordinate(event: StageEvent): {
     x: number
     y: number
   }
 }
 
-const QUALITY_BOOST = 1.5
 const MAX_RENDER_WIDTH = 1920
 const BASE_WIDTH = 640
 const BASE_HEIGHT = 360
 const PATCH_INTERVAL_MS = 300
 
+const RECORDING_FPS = 60
+const RECORDING_CHUNK_MS = 1000
+
 const runtimeState = {
+  settings: DEFAULT_SETTINGS,
   lastMode: '' as RenderMode | '',
   lastPatchAt: 0,
   lastObjectCount: 0,
   lastVariableCount: 0,
   lastResolution: 0,
+  wasRunning: false,
 }
+
+function initializeSettings(): void {
+  void loadSettings()
+    .then(settings => {
+      runtimeState.settings = settings
+    })
+    .catch(() => {
+      runtimeState.settings = DEFAULT_SETTINGS
+    })
+
+  observeSettings(settings => {
+    runtimeState.settings = settings
+  })
+}
+
+class PageAudioCollector {
+  private installed = false
+  private readonly mirrorDestinationByContext = new WeakMap<BaseAudioContext, MediaStreamAudioDestinationNode>()
+  private readonly mirroredNodes = new WeakMap<AudioNode, WeakSet<AudioNode>>()
+  private readonly knownStreams = new Set<MediaStream>()
+  private originalConnect?: typeof AudioNode.prototype.connect
+
+  install(): void {
+    if (this.installed || typeof AudioNode === 'undefined') return
+    this.originalConnect = AudioNode.prototype.connect
+
+    const collector = this
+    AudioNode.prototype.connect = function patchedConnect(this: AudioNode, destinationNode: AudioNode | AudioParam, ...args: number[]): AudioNode {
+      const connect = collector.originalConnect as unknown as (this: AudioNode, destination: AudioNode | AudioParam, ...rest: number[]) => AudioNode
+      const result = connect.call(this, destinationNode, ...args)
+
+      try {
+        if (!(destinationNode instanceof AudioDestinationNode)) return result
+        if (destinationNode.context !== this.context) return result
+
+        const mirrorDestination = collector.getOrCreateMirror(destinationNode.context)
+        if (!mirrorDestination) return result
+        if (!collector.markMirrorConnection(this, mirrorDestination)) return result
+
+        connect.call(this, mirrorDestination)
+      } catch {
+        // Best-effort patching only.
+      }
+
+      return result
+    } as typeof AudioNode.prototype.connect
+
+    this.installed = true
+  }
+
+  collectAudioStreams(documentRoot: Document): MediaStream[] {
+    const collected: MediaStream[] = []
+    const seenTrackIds = new Set<string>()
+
+    for (const stream of this.knownStreams) {
+      const liveTracks = stream.getAudioTracks().filter(track => track.readyState === 'live')
+      if (liveTracks.length === 0) continue
+      if (liveTracks.every(track => seenTrackIds.has(track.id))) continue
+      liveTracks.forEach(track => seenTrackIds.add(track.id))
+      collected.push(stream)
+    }
+
+    const mediaElements = Array.from(documentRoot.querySelectorAll('audio,video')) as Array<
+      HTMLMediaElement & {
+        captureStream?: () => MediaStream
+        mozCaptureStream?: () => MediaStream
+      }
+    >
+
+    for (const mediaElement of mediaElements) {
+      const capture = mediaElement.captureStream || mediaElement.mozCaptureStream
+      if (!capture) continue
+
+      try {
+        const stream = capture.call(mediaElement)
+        const liveTracks = stream.getAudioTracks().filter(track => track.readyState === 'live')
+        if (liveTracks.length === 0) continue
+        if (liveTracks.every(track => seenTrackIds.has(track.id))) continue
+        liveTracks.forEach(track => seenTrackIds.add(track.id))
+        collected.push(stream)
+      } catch {
+        // Ignore media elements that deny capture.
+      }
+    }
+
+    return collected
+  }
+
+  private getOrCreateMirror(context: BaseAudioContext): MediaStreamAudioDestinationNode | undefined {
+    const cached = this.mirrorDestinationByContext.get(context)
+    if (cached) return cached
+    if (!(context instanceof AudioContext)) return undefined
+    if (typeof context.createMediaStreamDestination !== 'function') return undefined
+
+    const mirror = context.createMediaStreamDestination()
+    this.mirrorDestinationByContext.set(context, mirror)
+    this.knownStreams.add(mirror.stream)
+    return mirror
+  }
+
+  private markMirrorConnection(sourceNode: AudioNode, mirrorNode: AudioNode): boolean {
+    let connectedMirrors = this.mirroredNodes.get(sourceNode)
+    if (!connectedMirrors) {
+      connectedMirrors = new WeakSet<AudioNode>()
+      this.mirroredNodes.set(sourceNode, connectedMirrors)
+    }
+
+    if (connectedMirrors.has(mirrorNode)) return false
+    connectedMirrors.add(mirrorNode)
+    return true
+  }
+}
+
+interface MixedAudioResult {
+  track?: MediaStreamTrack
+  cleanup(): void
+}
+
+function mixAudioStreams(audioStreams: MediaStream[]): MixedAudioResult {
+  if (audioStreams.length === 0 || typeof AudioContext === 'undefined') {
+    return { cleanup() {} }
+  }
+
+  let mixContext: AudioContext | undefined
+  try {
+    mixContext = new AudioContext()
+  } catch {
+    return { cleanup() {} }
+  }
+
+  const destination = mixContext.createMediaStreamDestination()
+  const sources: MediaStreamAudioSourceNode[] = []
+
+  for (const stream of audioStreams) {
+    const tracks = stream.getAudioTracks().filter(track => track.readyState === 'live')
+    if (tracks.length === 0) continue
+
+    try {
+      const sourceNode = mixContext.createMediaStreamSource(new MediaStream(tracks))
+      sourceNode.connect(destination)
+      sources.push(sourceNode)
+    } catch {
+      // Ignore streams that cannot be mixed.
+    }
+  }
+
+  void mixContext.resume().catch(() => {})
+
+  const track = destination.stream.getAudioTracks()[0]
+  return {
+    track,
+    cleanup: () => {
+      for (const sourceNode of sources) {
+        try {
+          sourceNode.disconnect()
+        } catch {
+          // Ignore disconnection errors.
+        }
+      }
+      try {
+        destination.disconnect()
+      } catch {
+        // Ignore disconnection errors.
+      }
+      void mixContext?.close().catch(() => {})
+    },
+  }
+}
+
+function pickRecorderMimeType(): string | undefined {
+  if (typeof MediaRecorder === 'undefined') return undefined
+
+  const candidates = [
+    'video/webm;codecs=vp9,opus',
+    'video/webm;codecs=vp8,opus',
+    'video/webm;codecs=opus',
+    'video/webm',
+  ]
+
+  return candidates.find(candidate => MediaRecorder.isTypeSupported(candidate))
+}
+
+function formatTimestamp(date: Date): string {
+  const pad = (value: number) => String(value).padStart(2, '0')
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}_${pad(date.getHours())}-${pad(date.getMinutes())}-${pad(date.getSeconds())}`
+}
+
+function saveRecordingBlob(blob: Blob, mimeType: string): void {
+  const extension = mimeType.includes('mp4') ? 'mp4' : 'webm'
+  const fileName = `entry-recording-${formatTimestamp(new Date())}.${extension}`
+  const objectUrl = URL.createObjectURL(blob)
+  const anchor = document.createElement('a')
+  anchor.href = objectUrl
+  anchor.download = fileName
+  anchor.style.display = 'none'
+  document.documentElement.appendChild(anchor)
+  anchor.click()
+  anchor.remove()
+  window.setTimeout(() => URL.revokeObjectURL(objectUrl), 5000)
+}
+
+class CanvasRecorder {
+  private recorder?: MediaRecorder
+  private outputStream?: MediaStream
+  private chunks: Blob[] = []
+  private saveOnStop = true
+  private starting = false
+  private cleanupMixedAudio?: () => void
+
+  constructor(private readonly audioCollector: PageAudioCollector) {}
+
+  isActive(): boolean {
+    if (this.starting) return true
+    if (!this.recorder) return false
+    return this.recorder.state !== 'inactive'
+  }
+
+  async start(canvasElement: HTMLCanvasElement, includeAudio: boolean): Promise<void> {
+    if (typeof MediaRecorder === 'undefined') return
+    if (this.starting) return
+    if (this.recorder && this.recorder.state !== 'inactive') return
+
+    this.starting = true
+    try {
+      const outputStream = new MediaStream()
+      const canvasStream = canvasElement.captureStream(RECORDING_FPS)
+      canvasStream.getVideoTracks().forEach(track => outputStream.addTrack(track))
+
+      const mixedAudio = includeAudio
+        ? mixAudioStreams(this.audioCollector.collectAudioStreams(document))
+        : { cleanup() {} }
+
+      if (mixedAudio.track) {
+        outputStream.addTrack(mixedAudio.track)
+      }
+
+      const preferredMimeType = pickRecorderMimeType()
+      const recorder = preferredMimeType
+        ? new MediaRecorder(outputStream, { mimeType: preferredMimeType })
+        : new MediaRecorder(outputStream)
+
+      this.recorder = recorder
+      this.outputStream = outputStream
+      this.cleanupMixedAudio = mixedAudio.cleanup
+      this.chunks = []
+      this.saveOnStop = true
+
+      recorder.ondataavailable = event => {
+        if (event.data.size > 0) this.chunks.push(event.data)
+      }
+
+      recorder.onstop = () => {
+        const mimeType = recorder.mimeType || preferredMimeType || 'video/webm'
+        const shouldSave = this.saveOnStop
+        const blob = this.chunks.length > 0
+          ? new Blob(this.chunks, { type: mimeType })
+          : undefined
+        this.chunks = []
+        this.releaseStreamResources()
+        if (shouldSave && blob && blob.size > 0) {
+          saveRecordingBlob(blob, mimeType)
+        }
+      }
+
+      recorder.onerror = () => {
+        this.chunks = []
+        this.releaseStreamResources()
+      }
+
+      recorder.start(RECORDING_CHUNK_MS)
+    } catch {
+      this.chunks = []
+      this.releaseStreamResources()
+    } finally {
+      this.starting = false
+    }
+  }
+
+  stop(saveFile: boolean): void {
+    if (!this.recorder) return
+    this.saveOnStop = saveFile
+
+    if (this.recorder.state === 'inactive') {
+      this.releaseStreamResources()
+      return
+    }
+    this.recorder.stop()
+  }
+
+  private releaseStreamResources(): void {
+    if (this.outputStream) {
+      this.outputStream.getTracks().forEach(track => track.stop())
+    }
+    this.outputStream = undefined
+
+    if (this.cleanupMixedAudio) {
+      this.cleanupMixedAudio()
+    }
+    this.cleanupMixedAudio = undefined
+    this.recorder = undefined
+  }
+}
+
+const pageAudioCollector = new PageAudioCollector()
+pageAudioCollector.install()
+const canvasRecorder = new CanvasRecorder(pageAudioCollector)
+initializeSettings()
 
 function getEntryGlobal(): EntryGlobal | undefined {
   const frameWindow = (document.querySelector('iframe.eaizycc0') as HTMLIFrameElement | null)?.contentWindow
@@ -182,7 +489,7 @@ function getEntryGlobal(): EntryGlobal | undefined {
   return hostWindow.Entry
 }
 
-function computeRenderSize(canvasElement: HTMLCanvasElement): { width: number, height: number } {
+function computeRenderSize(canvasElement: HTMLCanvasElement, qualityBoost: number): { width: number, height: number } {
   const cssWidth = Math.round(canvasElement.offsetWidth)
   if (cssWidth <= 0) return {
     width: Math.max(BASE_WIDTH, canvasElement.width || BASE_WIDTH),
@@ -193,7 +500,7 @@ function computeRenderSize(canvasElement: HTMLCanvasElement): { width: number, h
     BASE_WIDTH,
     Math.min(
       MAX_RENDER_WIDTH,
-      Math.round(cssWidth * Math.max(1, devicePixelRatio) * QUALITY_BOOST),
+      Math.round(cssWidth * Math.max(1, devicePixelRatio) * qualityBoost),
     ),
   )
 
@@ -288,6 +595,8 @@ function patchEntityObject(entry: EntryGlobal, stage: Stage, object: StageObject
 
   object.on(mode === 'webgl' ? '__pointerup' : 'pressmove', ({ stageX, stageY }) => {
     if (!stage.isEntitySelectable()) return
+    if (!object.offset) return
+
     const { entity } = object
     if (entity.parent.getLock()) return
     entity.setX((stageX - canvas.x) / canvas.scaleX + object.offset.x)
@@ -310,7 +619,10 @@ function patchVariableObject(stage: Stage, variable: StageObject, mode: RenderMo
       slideBar._viewportPatchedMode = key
       slideBar.removeAllListeners?.('__pointermove')
       slideBar.removeAllEventListeners?.('mousedown')
-      slideBar.on(downEvent, ({ stageX }) => isRunState() && variableObj.setSlideCommandX(stageX / canvas.scaleX - variableObj.getX() - canvas.x / canvas.scaleX))
+      slideBar.on(downEvent, ({ stageX }) => {
+        if (!isRunState()) return
+        variableObj.setSlideCommandX(stageX / canvas.scaleX - variableObj.getX() - canvas.x / canvas.scaleX)
+      })
     }
   }
 
@@ -328,7 +640,10 @@ function patchVariableObject(stage: Stage, variable: StageObject, mode: RenderMo
         variableObj.isAdjusting = true
         valueSetter.offsetX = stageX / canvas.scaleX - valueSetter.x
       })
-      valueSetter.on(moveEvent, ({ stageX }) => isRunState() && variableObj.setSlideCommandX(stageX / canvas.scaleX - valueSetter.offsetX + 5))
+      valueSetter.on(moveEvent, ({ stageX }) => {
+        if (!isRunState()) return
+        variableObj.setSlideCommandX(stageX / canvas.scaleX - valueSetter.offsetX + 5)
+      })
     }
   }
 
@@ -350,6 +665,7 @@ function patchVariableObject(stage: Stage, variable: StageObject, mode: RenderMo
         resizeHandle.parent.cursor = 'nwse-resize'
       })
       resizeHandle.on(moveEvent, ({ stageX, stageY }) => {
+        if (!resizeHandle.offset) return
         variableObj.setWidth(stageX / canvas.scaleX - resizeHandle.offset.x)
         variableObj.setHeight(stageY / canvas.scaleY - resizeHandle.offset.y)
         variableObj.updateView()
@@ -371,7 +687,8 @@ function patchVariableObject(stage: Stage, variable: StageObject, mode: RenderMo
         scrollButton.offsetY = stageY - scrollButton.y * canvas.scaleY
       })
       scrollButton.on(moveEvent, ({ stageY }) => {
-        const y = Math.max(25, Math.min(variableObj.getHeight() - 30, (stageY - scrollButton.offsetY) / canvas.scaleY))
+        const offsetY = scrollButton.offsetY || 0
+        const y = Math.max(25, Math.min(variableObj.getHeight() - 30, (stageY - offsetY) / canvas.scaleY))
         scrollButton.y = y
         variableObj.updateView()
       })
@@ -393,6 +710,7 @@ function patchVariableObject(stage: Stage, variable: StageObject, mode: RenderMo
     })
     variable.on(moveEvent, ({ stageX, stageY }) => {
       if (type !== 'workspace' || variableObj.isResizing || variableObj.isAdjusting) return
+      if (!variable.offset) return
       variableObj.setX((stageX - canvas.x) / canvas.scaleX + variable.offset.x)
       variableObj.setY((stageY - canvas.y) / canvas.scaleY + variable.offset.y)
       variableObj.updateView()
@@ -414,17 +732,57 @@ function updateEventCoordinate(stage: Stage): void {
   })
 }
 
+function handleAutoRecording(isRunning: boolean, canvasElement: HTMLCanvasElement | undefined, settings: ExtensionSettings): void {
+  const shouldRecord = settings.extensionEnabled && settings.autoRecordEnabled
+
+  if (!shouldRecord) {
+    if (canvasRecorder.isActive()) canvasRecorder.stop(true)
+    runtimeState.wasRunning = false
+    return
+  }
+
+  if (!canvasElement) {
+    if (runtimeState.wasRunning) canvasRecorder.stop(true)
+    runtimeState.wasRunning = false
+    return
+  }
+
+  if (isRunning && !runtimeState.wasRunning) {
+    void canvasRecorder.start(canvasElement, settings.includeAudio)
+  } else if (!isRunning && runtimeState.wasRunning) {
+    canvasRecorder.stop(true)
+  }
+
+  runtimeState.wasRunning = isRunning
+}
+
 function frame(): void {
   self.__REQUEST_ANIMATION_FRAME_ID = requestAnimationFrame(frame)
   try {
     const entry = getEntryGlobal()
     const stage = entry?.stage
-    if (!entry || !stage) return
+    const settings = runtimeState.settings
+
+    if (!entry || !stage) {
+      handleAutoRecording(false, undefined, settings)
+      return
+    }
+
+    const isRunning = entry.engine.isState('run')
+    handleAutoRecording(isRunning, stage.canvas.canvas, settings)
+
+    if (!settings.extensionEnabled) {
+      runtimeState.lastMode = ''
+      runtimeState.lastObjectCount = 0
+      runtimeState.lastVariableCount = 0
+      return
+    }
 
     const { useWebGL } = entry.options
     const mode: RenderMode = useWebGL ? 'webgl' : 'canvas'
+    const qualityBoost = settings.qualityEnabled ? settings.qualityBoost : 1
     const canvasElement = stage.canvas.canvas
-    const { width, height } = computeRenderSize(canvasElement)
+    const { width, height } = computeRenderSize(canvasElement, qualityBoost)
     const resolution = width / BASE_WIDTH
 
     const resized = canvasElement.width !== width || canvasElement.height !== height
@@ -454,7 +812,7 @@ function frame(): void {
       runtimeState.lastVariableCount = variableCount
     }
   } catch {
-    // Keep the render loop alive even when Entry internals temporarily change.
+    // Keep the animation loop alive when Entry internals change.
   }
 }
 

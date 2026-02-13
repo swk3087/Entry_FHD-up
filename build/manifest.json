@@ -9,10 +9,18 @@
     "48": "icons/48.png",
     "128": "icons/128.png"
   },
+  "permissions": [
+    "storage"
+  ],
+  "action": {
+    "default_title": "Entry FHD",
+    "default_popup": "popup.html"
+  },
   "content_scripts": [{
     "matches": ["https://playentry.org/*"],
     "js": ["dist/index.js"],
-    "world": "MAIN"
+    "world": "MAIN",
+    "run_at": "document_start"
   }],
   "browser_specific_settings": {
     "gecko": {

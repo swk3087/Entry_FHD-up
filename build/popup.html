@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Entry FHD</title>
+  <style>
+    :root {
+      color-scheme: light;
+      font-family: "Segoe UI", "Noto Sans", sans-serif;
+    }
+
+    body {
+      margin: 0;
+      background: #f6f7fb;
+      color: #1b2330;
+    }
+
+    .panel {
+      width: 320px;
+      padding: 14px;
+      display: grid;
+      gap: 10px;
+    }
+
+    h1 {
+      margin: 0 0 4px;
+      font-size: 16px;
+      font-weight: 700;
+    }
+
+    .field {
+      display: grid;
+      gap: 6px;
+      font-size: 13px;
+    }
+
+    .toggle {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 13px;
+    }
+
+    select {
+      width: 100%;
+      border: 1px solid #c8cfdd;
+      border-radius: 8px;
+      background: #fff;
+      padding: 6px 8px;
+      font-size: 13px;
+      color: #1b2330;
+    }
+
+    .hint {
+      margin: 0;
+      font-size: 12px;
+      color: #566178;
+      line-height: 1.4;
+    }
+
+    .status {
+      min-height: 16px;
+      margin: 0;
+      font-size: 12px;
+      color: #0f6c3a;
+      font-weight: 600;
+    }
+  </style>
+</head>
+<body>
+  <main class="panel">
+    <h1>Entry FHD</h1>
+
+    <label class="toggle" for="extensionEnabled">
+      <input id="extensionEnabled" type="checkbox">
+      <span>Enable extension</span>
+    </label>
+
+    <label class="toggle" for="qualityEnabled">
+      <input id="qualityEnabled" type="checkbox">
+      <span>Boost quality</span>
+    </label>
+
+    <div class="field">
+      <label for="qualityBoost">Quality scale</label>
+      <select id="qualityBoost">
+        <option value="1">100%</option>
+        <option value="1.25">125%</option>
+        <option value="1.5">150%</option>
+        <option value="1.75">175%</option>
+        <option value="2">200%</option>
+      </select>
+    </div>
+
+    <label class="toggle" for="autoRecordEnabled">
+      <input id="autoRecordEnabled" type="checkbox">
+      <span>Auto record while project runs</span>
+    </label>
+
+    <label class="toggle" for="includeAudio">
+      <input id="includeAudio" type="checkbox">
+      <span>Include page audio (mic off)</span>
+    </label>
+
+    <p class="hint">
+      Recording starts when the project enters run state and ends when run state stops.
+    </p>
+    <p class="status" id="saveState"></p>
+  </main>
+  <script src="dist/popup.js"></script>
+</body>
+</html>
